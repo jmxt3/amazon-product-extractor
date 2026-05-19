@@ -54,7 +54,9 @@ HEADERS = {
 
 # Amazon image URLs include a size token like `._AC_SX466_` or `._SL1500_`
 # right before the file extension. Removing it returns the largest original.
-SIZE_TOKEN_RE = re.compile(r"\._[A-Z0-9_,]+_(?=\.(?:jpg|jpeg|png|webp)$)", re.IGNORECASE)
+SIZE_TOKEN_RE = re.compile(
+    r"\._[A-Z0-9_,]+_(?=\.(?:jpg|jpeg|png|webp)$)", re.IGNORECASE
+)
 
 # Matches the `'colorImages': { 'initial': [ ... ] }` block embedded in the
 # product page's inline scripts. This block holds the full image gallery.
@@ -112,9 +114,11 @@ def extract_from_color_images(html: str) -> list[str]:
                 if isinstance(value, dict):
                     best = max(
                         value.items(),
-                        key=lambda kv: (kv[1][0] * kv[1][1])
-                        if isinstance(kv[1], list) and len(kv[1]) == 2
-                        else 0,
+                        key=lambda kv: (
+                            (kv[1][0] * kv[1][1])
+                            if isinstance(kv[1], list) and len(kv[1]) == 2
+                            else 0
+                        ),
                         default=(None, None),
                     )
                     if best[0]:
@@ -157,9 +161,11 @@ def extract_from_img_tags(html: str) -> list[str]:
             continue
         best = max(
             data.items(),
-            key=lambda kv: (kv[1][0] * kv[1][1])
-            if isinstance(kv[1], list) and len(kv[1]) == 2
-            else 0,
+            key=lambda kv: (
+                (kv[1][0] * kv[1][1])
+                if isinstance(kv[1], list) and len(kv[1]) == 2
+                else 0
+            ),
             default=(None, None),
         )
         if best[0]:
@@ -227,7 +233,10 @@ def _extract_variants(soup: BeautifulSoup) -> list[dict] | None:
             variants.append({"name": span["title"], "asin": asin_match.group(1)})
     if variants:
         return variants
-    for sel_id in ("native_dropdown_selected_size_name", "native_dropdown_selected_color_name"):
+    for sel_id in (
+        "native_dropdown_selected_size_name",
+        "native_dropdown_selected_color_name",
+    ):
         for option in soup.select(f"select#{sel_id} option[value]"):
             val = option["value"].strip()
             if val and re.fullmatch(r"[A-Z0-9]{10}", val):
@@ -382,7 +391,9 @@ def fetch_page_browser(url: str) -> str:
             )
             url = url.replace(original_netloc, final_netloc)
 
-        page.goto(url, wait_until="networkidle", timeout=45_000)
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        # Give JS a moment to hydrate the image gallery data into the DOM.
+        time.sleep(3)
         html = page.content()
         browser.close()
 
@@ -391,23 +402,62 @@ def fetch_page_browser(url: str) -> str:
 
 
 def fetch_page(url: str) -> str:
-    """Fallback: fetch via requests (no JS, may be blocked by Amazon)."""
+    """Fast fetch via requests (no JS). Raises RuntimeError if blocked."""
     parsed = urlparse(url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
 
     with requests.Session() as session:
         session.headers.update(HEADERS)
         try:
-            session.get(origin + "/", timeout=15)
+            session.get(origin + "/", timeout=10)
         except requests.RequestException:
             pass
         session.headers["referer"] = origin + "/"
         session.headers["sec-fetch-site"] = "same-origin"
-        response = session.get(url, timeout=30)
+        response = session.get(url, timeout=20)
 
     _check_for_bot_block(response)
     response.raise_for_status()
     return response.text
+
+
+_PRODUCT_SIGNALS = ("colorImages", "imageGalleryData", "productTitle", "data-a-dynamic-image")
+
+
+def _has_product_data(html: str) -> bool:
+    """Return True if the HTML looks like a real Amazon product page."""
+    return any(sig in html for sig in _PRODUCT_SIGNALS)
+
+
+def fetch_page_auto(url: str) -> str:
+    """Try fast requests fetch first; fall back to Playwright if blocked or empty.
+
+    This is the default mode. It gives you the speed of plain HTTP on networks
+    where Amazon allows it, and automatically escalates to a real browser when
+    the fast path is blocked or returns a silent bot-block page.
+    """
+    # --- Fast path ---
+    try:
+        print("  [1/2] Trying fast mode (requests)...", end=" ", flush=True)
+        html = fetch_page(url)
+        if _has_product_data(html):
+            print("OK")
+            return html
+        # Page loaded but no product content — silent bot-block.
+        print("blocked (no product data)")
+    except RuntimeError as exc:
+        print(f"blocked ({exc})")
+    except requests.RequestException as exc:
+        print(f"failed ({exc})")
+
+    # --- Slow path ---
+    if not PLAYWRIGHT_AVAILABLE:
+        raise RuntimeError(
+            "Requests fetch was blocked and Playwright is not installed. "
+            "Run `uv run playwright install chromium` and try again."
+        )
+    print("  [2/2] Falling back to browser mode (Playwright)...")
+    return fetch_page_browser(url)
 
 
 def _check_for_bot_block_html(html: str) -> None:
@@ -478,17 +528,27 @@ def main() -> int:
         help="Print image URLs without downloading them.",
     )
     parser.add_argument(
-        "--no-browser",
-        action="store_true",
-        help="Skip Playwright and use plain HTTP requests (faster but more likely to be blocked).",
+        "--mode",
+        choices=["auto", "requests", "browser"],
+        default="auto",
+        help=(
+            "Fetch strategy: "
+            "'auto' (default) tries requests first then falls back to Playwright; "
+            "'requests' uses plain HTTP only (fast, may be blocked); "
+            "'browser' uses Playwright only (slow, most reliable)."
+        ),
     )
     args = parser.parse_args()
 
-    use_browser = not args.no_browser and PLAYWRIGHT_AVAILABLE
-
-    print(f"Fetching {args.url}" + (" (browser mode)" if use_browser else " (requests mode)"))
+    mode_label = {"auto": "auto (fast -> browser)", "requests": "requests only", "browser": "browser only"}
+    print(f"Fetching {args.url}  [{mode_label[args.mode]}]")
     try:
-        html = fetch_page_browser(args.url) if use_browser else fetch_page(args.url)
+        if args.mode == "auto":
+            html = fetch_page_auto(args.url)
+        elif args.mode == "requests":
+            html = fetch_page(args.url)
+        else:
+            html = fetch_page_browser(args.url)
     except (requests.RequestException, RuntimeError, Exception) as exc:
         print(f"Failed to fetch page: {exc}", file=sys.stderr)
         return 1
@@ -506,7 +566,9 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     json_path = output_dir / "product.json"
-    json_path.write_text(json.dumps(details, indent=2, ensure_ascii=False), encoding="utf-8")
+    json_path.write_text(
+        json.dumps(details, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     print(f"Saved product details to {json_path}")
 
     if not image_urls:

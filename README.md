@@ -13,14 +13,15 @@ Extracts product details and images from an Amazon product page URL. Each produc
 git clone <repo-url>
 cd amazon_product_extractor
 uv sync
+uv run playwright install chromium
 ```
 
-`uv sync` reads `pyproject.toml` and installs all dependencies into an isolated virtual environment automatically.
+`uv sync` installs all Python dependencies. The second command downloads the Chromium browser used to bypass Amazon's bot detection.
 
 ## Usage
 
 ```
-uv run main.py <amazon-product-url> [--output DIR] [--dry-run]
+uv run amazon-extract <amazon-product-url> [--output DIR] [--dry-run] [--mode MODE]
 ```
 
 ### Arguments
@@ -30,27 +31,31 @@ uv run main.py <amazon-product-url> [--output DIR] [--dry-run]
 | `url` | Full Amazon product page URL (required) |
 | `-o`, `--output DIR` | Base folder for output (default: `./images`) |
 | `--dry-run` | Print extracted product JSON to stdout — no files written |
+| `--mode MODE` | Fetch strategy: `auto` (default), `requests`, or `browser` |
 
 ### Examples
 
 ```bash
-# Extract product details and download images
-uv run main.py "https://www.amazon.com/dp/B085383P7M"
+# Extract product details and download all images (auto mode: tries fast first)
+uv run amazon-extract "https://www.amazon.com/dp/B07MHJFRBJ"
 
 # Save to a custom folder
-uv run main.py "https://www.amazon.com/dp/B085383P7M" --output ./products
+uv run amazon-extract "https://www.amazon.com/dp/B07MHJFRBJ" --output ./products
+
+# Brazilian storefront
+uv run amazon-extract "https://www.amazon.com.br/dp/B09JQMJHXY" --output ./products
 
 # UK storefront
-uv run main.py "https://www.amazon.co.uk/dp/B085FYSG5K" --output ./products
+uv run amazon-extract "https://www.amazon.co.uk/dp/B085FYSG5K" --output ./products
 
 # Preview extracted data without writing any files
-uv run main.py "https://www.amazon.com/dp/B085383P7M" --dry-run
-```
+uv run amazon-extract "https://www.amazon.com/dp/B08N5WRWNW" --dry-run
 
-You can also run the installed entry point directly after `uv sync`:
+# Force fast requests-only mode (skips Playwright even if blocked)
+uv run amazon-extract "https://www.amazon.com/dp/B08N5WRWNW" --mode requests
 
-```bash
-uv run amazon-extract "https://www.amazon.com/dp/B085383P7M"
+# Force browser-only mode (skips the fast attempt)
+uv run amazon-extract "https://www.amazon.com/dp/B08N5WRWNW" --mode browser
 ```
 
 ## Output
@@ -59,7 +64,7 @@ For each product URL a subfolder named after the ASIN is created inside the outp
 
 ```
 images/
-  B085383P7M/
+  B08N5WRWNW/
     product.json
     01_61CBqERgZ7L.jpg
     02_71xhv...jpg
@@ -74,16 +79,15 @@ images/
 
 ```json
 {
-  "name": "2020 HP 15.6\" Laptop Computer, 10th Gen Intel Quard-Core i7 1065G7 up to 3.9GHz, 16GB DDR4 RAM, 512GB PCIe SSD",
-  "price": "$959.00",
-  "short_description": "Powered by latest 10th Gen Intel Core i7-1065G7 Processor @ 1.30GHz...\n15.6\" diagonal HD SVA BrightView micro-edge WLED-backlit...",
-  "images": "{\"https://images-na.ssl-images-amazon.com/images/I/61CBqERgZ7L._AC_SX425_.jpg\":[425,425],...}",
+  "name": "Apple AirPods Pro (2nd Generation)",
+  "price": "$249.00",
+  "short_description": "Active Noise Cancellation reduces unwanted background noise...\nTransparency mode for hearing and connecting with the world around you...",
+  "images": "{\"https://m.media-amazon.com/images/I/71bhWgQK-cL.jpg\":[679,679],...}",
   "variants": [
-    { "name": "Click to select 4GB DDR4 RAM, 128GB PCIe SSD", "asin": "B01MCZ4LH1" },
-    { "name": "Click to select 16GB DDR4 RAM, 512GB PCIe SSD", "asin": "B085383P7M" }
+    { "name": "AirPods Pro", "asin": "B0BDHWDR12" }
   ],
-  "product_description": "Capacity: 16GB DDR4 RAM, 512GB PCIe SSD\n\nProcessor\n  Intel Core i7-1065G7...",
-  "link_to_all_reviews": "https://www.amazon.com/HP-Computer.../product-reviews/B085383P7M/..."
+  "product_description": "Rebuilt from the ground up, AirPods Pro...",
+  "link_to_all_reviews": "https://www.amazon.com/product-reviews/B0BDHWDR12/..."
 }
 ```
 
@@ -101,7 +105,22 @@ The downloaded image files are the highest-resolution versions of the URLs liste
 
 ## How it works
 
-The script fetches the page HTML with a browser-like set of headers (matching Chrome on macOS, including `sec-fetch-*` fields and a matching `referer`) to pass Amazon's bot checks. Image URLs are then pulled from three sources in order of preference:
+By default the tool uses an **auto strategy** — it tries the fast path first and only escalates to the slow path if needed:
+
+| Step | Method | Speed | Reliability |
+|---|---|---|---|
+| **[1/2] Fast path** | Plain HTTP (`requests`) | ~1–2 s | Blocked on some networks |
+| **[2/2] Slow path** | Headless Chromium (Playwright) | ~10–15 s | Bypasses bot detection |
+
+If the fast path succeeds and returns a real product page, Playwright is never launched. If it's blocked (by status code, bot-block phrases, or returning a page with no product data), the browser fallback kicks in automatically.
+
+You can override this with `--mode requests` (fast only) or `--mode browser` (browser only).
+
+The browser fetch sequence:
+1. Visits the Amazon homepage first to collect session cookies and detect any **geo-redirect** (e.g. `amazon.com` → `amazon.com.br` based on your IP). The product URL is automatically rewritten to the resolved regional domain.
+2. Navigates to the product page, masks the automation fingerprint, and waits for the DOM to load.
+
+Image URLs are pulled from three sources in order of preference:
 
 1. The `colorImages` block embedded in inline scripts — the authoritative gallery including all colour variants.
 2. The `imageGalleryData` array used by some product pages.
@@ -111,6 +130,7 @@ Each image URL is normalized by stripping Amazon's size token (e.g. `._AC_SX466_
 
 ## Notes
 
-- Amazon actively blocks automated requests. If you see a bot-block error, wait a few minutes or try from a different network.
+- **"Page Not Found" errors** mean the ASIN is invalid, region-restricted, or the product has been removed — not a bot-block.
+- **CAPTCHA errors** mean Amazon is blocking requests from your IP. Try again later or from a different network.
 - Only the images for the default variant are downloaded. To extract a specific variant, pass its own product URL.
 - This tool is intended for personal use (research, archiving your own purchases). Respect Amazon's Terms of Service.
