@@ -1,0 +1,13 @@
+[project]
+name = "amazon-product-extractor"
+version = "0.1.0"
+description = "Extract all product images from an Amazon product page URL."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "requests>=2.32.0",
+    "beautifulsoup4>=4.12.0",
+]
+
+[project.scripts]
+amazon-extract = "main:main"
