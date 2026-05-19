@@ -25,19 +25,23 @@ HEADERS = {
     "dnt": "1",
     "upgrade-insecure-requests": "1",
     "user-agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) "
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/83.0.4103.61 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
     "accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9"
+        "image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
     ),
-    "sec-fetch-site": "same-origin",
-    "sec-fetch-mode": "navigate",
-    "sec-fetch-user": "?1",
+    "accept-encoding": "gzip, deflate, br",
+    "accept-language": "en-US,en;q=0.9",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
     "sec-fetch-dest": "document",
-    "accept-language": "en-GB,en-US;q=0.9,en;q=0.8",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "none",
+    "sec-fetch-user": "?1",
 }
 
 # Amazon image URLs include a size token like `._AC_SX466_` or `._SL1500_`
@@ -314,27 +318,57 @@ def download_images(urls: list[str], output_dir: Path) -> list[Path]:
 
 
 def fetch_page(url: str) -> str:
-    """Fetch the Amazon product page HTML."""
+    """Fetch the Amazon product page HTML.
+
+    Strategy:
+    1. Open a session and warm it up by visiting the Amazon homepage first
+       so we receive real cookies (session-id, ubid, etc.) before hitting
+       the product page.  Without cookies Amazon frequently serves 404/503.
+    2. The product request sets `referer` to the homepage, which matches
+       what a real browser would send after browsing.
+    """
     parsed = urlparse(url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
-    headers = {**HEADERS, "referer": origin + "/"}
 
     with requests.Session() as session:
-        session.headers.update(headers)
+        session.headers.update(HEADERS)
+
+        # Warm up: visit the homepage to collect cookies.
+        try:
+            session.get(origin + "/", timeout=15)
+        except requests.RequestException:
+            pass  # Non-fatal — proceed anyway.
+
+        # Now fetch the product page with referer set.
+        session.headers["referer"] = origin + "/"
+        session.headers["sec-fetch-site"] = "same-origin"
         response = session.get(url, timeout=30)
 
-    if response.status_code > 500:
-        if "To discuss automated access to Amazon data please contact" in response.text:
-            raise RuntimeError(
-                f"Page was blocked by Amazon (status {response.status_code}). "
-                "Try again later or from a different network."
-            )
-        raise RuntimeError(
-            f"Amazon returned status {response.status_code} — likely a bot-block."
-        )
-
+    _check_for_bot_block(response)
     response.raise_for_status()
     return response.text
+
+
+def _check_for_bot_block(response: requests.Response) -> None:
+    """Raise a clear RuntimeError if Amazon returned a bot-block page."""
+    code = response.status_code
+    text = response.text
+    bot_phrases = [
+        "To discuss automated access to Amazon data please contact",
+        "Sorry, we just need to make sure you\'re not a robot",
+        "Enter the characters you see below",
+        "api-services-support@amazon.com",
+    ]
+    if any(phrase in text for phrase in bot_phrases):
+        raise RuntimeError(
+            f"Page was blocked by Amazon's bot detection (HTTP {code}). "
+            "Try again later, use a different network, or add a delay between requests."
+        )
+    if code in (404, 503) or code >= 500:
+        raise RuntimeError(
+            f"Amazon returned HTTP {code}. This is usually a bot-block or geo-restriction. "
+            "Try again later or from a different network."
+        )
 
 
 def main() -> int:

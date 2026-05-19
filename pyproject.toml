@@ -7,7 +7,14 @@ requires-python = ">=3.13"
 dependencies = [
     "requests>=2.32.0",
     "beautifulsoup4>=4.12.0",
+    "playwright>=1.60.0",
 ]
 
 [project.scripts]
 amazon-extract = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.uv]
+package = true
