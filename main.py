@@ -13,11 +13,19 @@ import argparse
 import json
 import re
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+try:
+    from playwright.sync_api import sync_playwright  # type: ignore
+
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 
 # Headers that closely mimic a real Chrome browser on macOS.
 # The sec-fetch-* set and dnt are checked by Amazon's bot detection.
@@ -317,29 +325,82 @@ def download_images(urls: list[str], output_dir: Path) -> list[Path]:
     return saved
 
 
-def fetch_page(url: str) -> str:
-    """Fetch the Amazon product page HTML.
+def fetch_page_browser(url: str) -> str:
+    """Fetch the Amazon product page using a real headless Chromium browser.
 
-    Strategy:
-    1. Open a session and warm it up by visiting the Amazon homepage first
-       so we receive real cookies (session-id, ubid, etc.) before hitting
-       the product page.  Without cookies Amazon frequently serves 404/503.
-    2. The product request sets `referer` to the homepage, which matches
-       what a real browser would send after browsing.
+    This bypasses Amazon's bot detection because Playwright renders full JS,
+    handles cookies/fingerprinting, and looks identical to a real user session.
+    Also handles Amazon geo-redirects (e.g. amazon.com -> amazon.com.br).
     """
+    if not PLAYWRIGHT_AVAILABLE:
+        raise RuntimeError(
+            "Playwright is not installed. Run `uv add playwright && uv run playwright install chromium`."
+        )
+
+    parsed = urlparse(url)
+    original_netloc = parsed.netloc
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
+        context = browser.new_context(
+            user_agent=HEADERS["user-agent"],
+            locale="en-US",
+            viewport={"width": 1366, "height": 768},
+            extra_http_headers={
+                "accept-language": HEADERS["accept-language"],
+                "dnt": HEADERS["dnt"],
+            },
+        )
+        page = context.new_page()
+
+        # Mask the webdriver flag that Amazon looks for.
+        page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+
+        # Warm up: visit the homepage to collect cookies and detect geo-redirect.
+        try:
+            page.goto(origin + "/", wait_until="domcontentloaded", timeout=20_000)
+            time.sleep(1)
+        except Exception:
+            pass
+
+        # Detect if Amazon redirected us to a regional domain (e.g. .com -> .com.br).
+        final_home_url = page.url
+        final_netloc = urlparse(final_home_url).netloc
+        if final_netloc and final_netloc != original_netloc:
+            print(
+                f"  Note: Amazon redirected to regional domain ({final_netloc}). "
+                f"Rewriting product URL."
+            )
+            url = url.replace(original_netloc, final_netloc)
+
+        page.goto(url, wait_until="networkidle", timeout=45_000)
+        html = page.content()
+        browser.close()
+
+    _check_for_bot_block_html(html)
+    return html
+
+
+def fetch_page(url: str) -> str:
+    """Fallback: fetch via requests (no JS, may be blocked by Amazon)."""
     parsed = urlparse(url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
 
     with requests.Session() as session:
         session.headers.update(HEADERS)
-
-        # Warm up: visit the homepage to collect cookies.
         try:
             session.get(origin + "/", timeout=15)
         except requests.RequestException:
-            pass  # Non-fatal — proceed anyway.
-
-        # Now fetch the product page with referer set.
+            pass
         session.headers["referer"] = origin + "/"
         session.headers["sec-fetch-site"] = "same-origin"
         response = session.get(url, timeout=30)
@@ -349,13 +410,42 @@ def fetch_page(url: str) -> str:
     return response.text
 
 
+def _check_for_bot_block_html(html: str) -> None:
+    """Raise if the rendered HTML looks like a bot-block, CAPTCHA, or 404 page."""
+    # Genuine product-not-found: tiny page with no product data.
+    not_found_phrases = [
+        "<title>Page Not Found</title>",
+        "Page Not Found",
+        "N\u00e3o foi poss\u00edvel encontrar esta p\u00e1gina",  # amazon.com.br Portuguese 404
+        "p\u00e1gina n\u00e3o encontrada",
+    ]
+    if any(p in html for p in not_found_phrases) and len(html) < 10_000:
+        raise RuntimeError(
+            "Amazon returned a 'Page Not Found' page. "
+            "The ASIN may be invalid, region-restricted, or the product may have been removed."
+        )
+
+    bot_phrases = [
+        "To discuss automated access to Amazon data please contact",
+        "Sorry, we just need to make sure you're not a robot",
+        "Enter the characters you see below",
+        "api-services-support@amazon.com",
+        "Type the characters you see in this image",
+    ]
+    if any(phrase in html for phrase in bot_phrases):
+        raise RuntimeError(
+            "Amazon served a CAPTCHA/bot-block page even with a real browser. "
+            "Try again later or from a different network."
+        )
+
+
 def _check_for_bot_block(response: requests.Response) -> None:
     """Raise a clear RuntimeError if Amazon returned a bot-block page."""
     code = response.status_code
     text = response.text
     bot_phrases = [
         "To discuss automated access to Amazon data please contact",
-        "Sorry, we just need to make sure you\'re not a robot",
+        "Sorry, we just need to make sure you're not a robot",
         "Enter the characters you see below",
         "api-services-support@amazon.com",
     ]
@@ -387,12 +477,19 @@ def main() -> int:
         action="store_true",
         help="Print image URLs without downloading them.",
     )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Skip Playwright and use plain HTTP requests (faster but more likely to be blocked).",
+    )
     args = parser.parse_args()
 
-    print(f"Fetching {args.url}")
+    use_browser = not args.no_browser and PLAYWRIGHT_AVAILABLE
+
+    print(f"Fetching {args.url}" + (" (browser mode)" if use_browser else " (requests mode)"))
     try:
-        html = fetch_page(args.url)
-    except (requests.RequestException, RuntimeError) as exc:
+        html = fetch_page_browser(args.url) if use_browser else fetch_page(args.url)
+    except (requests.RequestException, RuntimeError, Exception) as exc:
         print(f"Failed to fetch page: {exc}", file=sys.stderr)
         return 1
 
